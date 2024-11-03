@@ -34,7 +34,7 @@ struct FanData {
     int level = 0;
     std::vector<float> history;
     float fps = 60.0f;
-    float scale = 100.0f;
+    float scale = 5000.0f;
     bool animate = true;
 };
 
@@ -170,32 +170,166 @@ void updateCPUData() {
 
 void updateFanData() {
     if (!g_fan_data.animate) return;
-
-    // Read fan data from /sys/class/hwmon
-    // This is hardware-dependent, so we'll need to detect the right path
-    DIR* hwmon = opendir("/sys/class/hwmon");
-    if (!hwmon) return;
-
-    struct dirent* entry;
-    while ((entry = readdir(hwmon)) != nullptr) {
-        std::string base_path = std::string("/sys/class/hwmon/") + entry->d_name + "/";
+    
+    // Try to detect fan capabilities if not already checked
+    static bool fan_capability_checked = false;
+    static bool fan_monitoring_available = false;
+    
+    if (!fan_capability_checked) {
+        // Check if any fan monitoring interface exists
+        const std::vector<std::string> possible_paths = {
+            "/sys/class/hwmon",
+            "/proc/acpi/ibm/fan",
+            "/sys/devices/platform/coretemp.0/hwmon",
+            "/sys/class/thermal"
+        };
         
-        // Try to read fan1_input for speed
-        std::string speed_str = readFileContent(base_path + "fan1_input");
-        if (!speed_str.empty()) {
-            g_fan_data.speed = std::stoi(speed_str);
-            g_fan_data.enabled = g_fan_data.speed > 0;
-            g_fan_data.history.push_back(static_cast<float>(g_fan_data.speed));
-            
-            // Keep history at reasonable size
-            if (g_fan_data.history.size() > 100) {
-                g_fan_data.history.erase(g_fan_data.history.begin());
+        for (const auto& path : possible_paths) {
+            if (access(path.c_str(), F_OK) == 0) {
+                fan_monitoring_available = true;
+                break;
             }
-            break;
+        }
+        
+        fan_capability_checked = true;
+        
+        if (!fan_monitoring_available) {
+            std::cerr << "Warning: No fan monitoring interfaces detected on this system" << std::endl;
         }
     }
-    closedir(hwmon);
-}
+    
+    // If no fan monitoring is available, use simulated/placeholder data
+    if (!fan_monitoring_available) {
+        g_fan_data.enabled = false;
+        g_fan_data.speed = 0;
+        g_fan_data.level = 0;
+        g_fan_data.history.push_back(0.0f);
+        if (g_fan_data.history.size() > 100) {
+            g_fan_data.history.erase(g_fan_data.history.begin());
+        }
+        return;
+    }
+    
+    bool fan_found = false;
+
+    // Method 1: Try ThinkPad-specific fan interface
+    std::string fan_data = readFileContent("/proc/acpi/ibm/fan");
+    if (!fan_data.empty()) {
+        std::istringstream iss(fan_data);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (line.find("status:") != std::string::npos) {
+                g_fan_data.enabled = (line.find("disabled") == std::string::npos);
+            }
+            else if (line.find("speed:") != std::string::npos) {
+                size_t pos = line.find(":");
+                if (pos != std::string::npos) {
+                    std::string speed_str = line.substr(pos + 1);
+                    speed_str.erase(0, speed_str.find_first_not_of(" \t\r\n"));
+                    try {
+                        g_fan_data.speed = std::stoi(speed_str);
+                        fan_found = true;
+                    } catch (...) {}
+                }
+            }
+        }
+    }
+
+    // Method 2: Try generic hwmon interface
+    if (!fan_found) {
+        const std::vector<std::string> hwmon_paths = {
+            "/sys/class/hwmon",
+            "/sys/devices/platform/coretemp.0/hwmon",
+            "/sys/devices/platform/it87.2608/hwmon",
+            "/sys/devices/platform/nct6775.2592/hwmon"
+        };
+
+        for (const auto& base_path : hwmon_paths) {
+            DIR* hwmon = opendir(base_path.c_str());
+            if (!hwmon) continue;
+
+            struct dirent* entry;
+            while ((entry = readdir(hwmon)) != nullptr) {
+                if (entry->d_name[0] == '.') continue;
+
+                std::string device_path = base_path + "/" + entry->d_name + "/";
+                
+                // Try different fan input files
+                const std::vector<std::string> fan_files = {
+                    "fan1_input",
+                    "fan2_input",
+                    "fan3_input"
+                };
+
+                for (const auto& fan_file : fan_files) {
+                    std::string speed_str = readFileContent(device_path + fan_file);
+                    if (!speed_str.empty()) {
+                        try {
+                            int speed = std::stoi(speed_str);
+                            if (speed >= 0) {
+                                g_fan_data.speed = speed;
+                                g_fan_data.enabled = (speed > 0);
+                                fan_found = true;
+                                break;
+                            }
+                        } catch (...) {}
+                    }
+                }
+
+                if (fan_found) {
+                    // Try to read PWM value
+                    std::string pwm_str = readFileContent(device_path + "pwm1");
+                    if (!pwm_str.empty()) {
+                        try {
+                            g_fan_data.level = std::stoi(pwm_str) * 100 / 255;
+                        } catch (...) {}
+                    }
+                    break;
+                }
+            }
+            closedir(hwmon);
+            if (fan_found) break;
+        }
+    }
+
+    // Method 3: Try ACPI thermal zone fans
+    if (!fan_found) {
+        DIR* thermal = opendir("/sys/class/thermal");
+        if (thermal) {
+            struct dirent* entry;
+            while ((entry = readdir(thermal)) != nullptr) {
+                if (strncmp(entry->d_name, "thermal_zone", 11) == 0) {
+                    std::string path = "/sys/class/thermal/" + std::string(entry->d_name) + "/";
+                    std::string type = readFileContent(path + "type");
+                    if (type.find("fan") != std::string::npos) {
+                        std::string temp = readFileContent(path + "temp");
+                        try {
+                            g_fan_data.speed = std::stoi(temp);
+                            g_fan_data.enabled = (g_fan_data.speed > 0);
+                            fan_found = true;
+                            break;
+                        } catch (...) {}
+                    }
+                }
+            }
+            closedir(thermal);
+        }
+    }
+
+    // If no fan data found, mark as inactive
+    if (!fan_found) {
+        g_fan_data.enabled = false;
+        g_fan_data.speed = 0;
+        g_fan_data.level = 0;
+    }
+
+    // Update history
+    g_fan_data.history.push_back(static_cast<float>(g_fan_data.speed));
+    if (g_fan_data.history.size() > 100) {
+        g_fan_data.history.erase(g_fan_data.history.begin());
+    }
+
+  }
 
 void updateThermalData() {
     if (!g_thermal_data.animate) return;
@@ -264,11 +398,28 @@ void renderFanTab() {
     ImGui::SliderFloat("FPS##fan", &g_fan_data.fps, 1.0f, 60.0f);
     
     // Scale Slider
-    ImGui::SliderFloat("Scale##fan", &g_fan_data.scale, 0.0f, 10000.0f);
+    ImGui::SliderFloat("Scale##fan", &g_fan_data.scale, 0.0f, 5000.0f);
     
     // Animation Toggle
     ImGui::Checkbox("Animate##fan", &g_fan_data.animate);
     
+    ImGui::Spacing();
+    
+    // Add a notice if fan monitoring is not available
+    static bool fan_available = (access("/sys/class/hwmon", F_OK) == 0 || 
+                               access("/proc/acpi/ibm/fan", F_OK) == 0);
+    
+    if (!fan_available) {
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), 
+            "Fan monitoring is not available on this system");
+        ImGui::TextWrapped("This could be because:");
+        ImGui::BulletText("The system doesn't expose fan information");
+        ImGui::BulletText("Required kernel modules are not loaded");
+        ImGui::BulletText("Insufficient permissions to access fan data");
+        ImGui::Spacing();
+    }
+    
+    // Status information
     ImGui::Text("Fan Status: %s", g_fan_data.enabled ? "Active" : "Inactive");
     ImGui::Text("Speed: %d RPM", g_fan_data.speed);
     ImGui::Text("Level: %d", g_fan_data.level);
