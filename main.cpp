@@ -1,6 +1,11 @@
 #include <GL/glew.h>
 #include <SDL.h>
 #include <SDL_opengl.h>
+#include <fstream>
+#include <dirent.h>
+#include <ctype.h>
+#include <cstring>
+#include <cstdlib>
 
 #include "header.h"
 
@@ -116,6 +121,92 @@ int main(int, char **)
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(window);
     }
+
+    // Print debug statistics before cleanup
+    printf("\n=== SYSTEM MONITOR DEBUG STATISTICS ===\n");
+
+    // Memory statistics
+    std::ifstream meminfo("/proc/meminfo");
+    std::string line;
+    size_t mem_total = 0, mem_available = 0, swap_total = 0, swap_free = 0;
+
+    while (std::getline(meminfo, line)) {
+        if (line.find("MemTotal:") == 0)
+            sscanf(line.c_str(), "MemTotal: %zu kB", &mem_total);
+        else if (line.find("MemAvailable:") == 0)
+            sscanf(line.c_str(), "MemAvailable: %zu kB", &mem_available);
+        else if (line.find("SwapTotal:") == 0)
+            sscanf(line.c_str(), "SwapTotal: %zu kB", &swap_total);
+        else if (line.find("SwapFree:") == 0)
+            sscanf(line.c_str(), "SwapFree: %zu kB", &swap_free);
+    }
+
+    printf("Debug: mem_total=%zu, mem_available=%zu\n", mem_total, mem_available);
+    if (mem_total > 0 && mem_available > 0) {
+        size_t mem_used = mem_total - mem_available;
+        float mem_percent = ((float)mem_used / mem_total) * 100.0f;
+        printf("RAM: %.1f%% (%zu MB used / %zu MB total)\n",
+               mem_percent, mem_used/1024, mem_total/1024);
+    } else {
+        printf("RAM: Could not read memory information\n");
+    }
+
+    printf("Debug: swap_total=%zu, swap_free=%zu\n", swap_total, swap_free);
+    if (swap_total > 0) {
+        size_t swap_used = swap_total - swap_free;
+        float swap_percent = ((float)swap_used / swap_total) * 100.0f;
+        printf("SWAP: %.1f%% (%zu MB used / %zu MB total)\n",
+               swap_percent, swap_used/1024, swap_total/1024);
+    } else {
+        printf("SWAP: No swap space detected (total=%zu)\n", swap_total);
+    }
+
+    // Process count
+    int process_count = 0;
+    DIR* proc_dir = opendir("/proc");
+    if (proc_dir) {
+        struct dirent* entry;
+        while ((entry = readdir(proc_dir)) != nullptr) {
+            if (isdigit(entry->d_name[0])) {
+                process_count++;
+            }
+        }
+        closedir(proc_dir);
+    }
+    printf("Processes: %d total detected\n", process_count);
+
+    // Sample process memory calculation
+    printf("Sample process memory calculation:\n");
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    printf("  Page size: %ld bytes\n", page_size);
+
+    FILE* self_stat = fopen("/proc/self/stat", "r");
+    if (self_stat) {
+        // Read the entire line and parse field 24 (RSS)
+        char line[1024];
+        if (fgets(line, sizeof(line), self_stat)) {
+            char* token = strtok(line, " ");
+            long rss = 0;
+            for (int i = 1; i < 24 && token; i++) {
+                token = strtok(NULL, " ");
+                if (i == 23 && token) { // Field 24 (0-based index 23)
+                    rss = atol(token);
+                }
+            }
+
+            if (rss > 0) {
+                unsigned long process_memory = rss * page_size;
+                float mem_percentage = ((double)process_memory / (double)(mem_total * 1024)) * 100.0;
+                printf("  Monitor process: %ld pages = %lu bytes = %.3f%% of RAM\n",
+                       rss, process_memory, mem_percentage);
+            } else {
+                printf("  Could not read RSS from /proc/self/stat\n");
+            }
+        }
+        fclose(self_stat);
+    }
+
+    printf("=======================================\n\n");
 
     // Cleanup
     ImGui_ImplOpenGL3_Shutdown();

@@ -80,8 +80,7 @@ endif
 %.o:$(IMGUI_DIR)/backend/%.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
-%.o:imgui/lib/glad/src/%.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+
 
 all: $(EXE)
 	@echo Build complete for $(ECHO_MESSAGE)

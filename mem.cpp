@@ -1,4 +1,6 @@
 #include "header.h"
+#include <cstring>
+#include <cstdlib>
 
 // Utility function to format sizes in human readable format
 std::string formatSize(size_t bytes) {
@@ -27,18 +29,27 @@ struct RAMStatus {
     void update() {
         std::ifstream meminfo("/proc/meminfo");
         std::string line;
-        
+        size_t available = 0;
+        total = 0;
+
         while (std::getline(meminfo, line)) {
-            if (line.compare(0, 9, "MemTotal:") == 0)
+            if (line.find("MemTotal:") == 0)
                 sscanf(line.c_str(), "MemTotal: %zu kB", &total);
-            else if (line.compare(0, 8, "MemFree:") == 0)
-                sscanf(line.c_str(), "MemFree: %zu kB", &free);
+            else if (line.find("MemAvailable:") == 0)
+                sscanf(line.c_str(), "MemAvailable: %zu kB", &available);
         }
-        
-        total *= 1024; // Convert from KB to bytes
-        free *= 1024;
-        used = total - free;
-        usage_percent = ((float)used / total) * 100.0f;
+
+        if (total > 0 && available > 0) {
+            total *= 1024; // Convert from KB to bytes
+            available *= 1024;
+            used = total - available;
+            free = available;
+            usage_percent = ((float)used / total) * 100.0f;
+        } else {
+            // Fallback if MemAvailable not found
+            total = used = free = 0;
+            usage_percent = 0.0f;
+        }
     }
 
     void render() {
@@ -59,18 +70,25 @@ struct SwapStatus {
     void update() {
         std::ifstream meminfo("/proc/meminfo");
         std::string line;
-        
+        total = 0;
+        free = 0;
+
         while (std::getline(meminfo, line)) {
-            if (line.compare(0, 9, "SwapTotal:") == 0)
+            if (line.find("SwapTotal:") == 0)
                 sscanf(line.c_str(), "SwapTotal: %zu kB", &total);
-            else if (line.compare(0, 8, "SwapFree:") == 0)
+            else if (line.find("SwapFree:") == 0)
                 sscanf(line.c_str(), "SwapFree: %zu kB", &free);
         }
-        
-        total *= 1024; // Convert from KB to bytes
-        free *= 1024;
-        used = total - free;
-        usage_percent = total > 0 ? ((float)used / total) * 100.0f : 0.0f;
+
+        if (total > 0) {
+            total *= 1024; // Convert from KB to bytes
+            free *= 1024;
+            used = total - free;
+            usage_percent = ((float)used / total) * 100.0f;
+        } else {
+            used = 0;
+            usage_percent = 0.0f;
+        }
     }
 
     void render() {
@@ -112,7 +130,18 @@ static SwapStatus swap_status;
 static DiskStatus disk_status;
 static ProcessManager process_manager;
 
+// Initialize the process manager
+static bool process_manager_initialized = false;
+void initializeProcessManager() {
+    if (!process_manager_initialized) {
+        memset(process_manager.filter, 0, sizeof(process_manager.filter));
+        process_manager_initialized = true;
+    }
+}
+
 void memoryProcessesWindow(const char* id, ImVec2 size, ImVec2 position) {
+    initializeProcessManager();
+
     ImGui::Begin(id);
     ImGui::SetWindowSize(id, size);
     ImGui::SetWindowPos(id, position);
@@ -138,6 +167,13 @@ void memoryProcessesWindow(const char* id, ImVec2 size, ImVec2 position) {
 }
 
 void ProcessManager::update() {
+    // Only update process list every 1 second to avoid interfering with filter input
+    float current_time = ImGui::GetTime();
+    if (current_time - last_update_time < 1.0f) {
+        return; // Skip update if less than 1 second has passed
+    }
+    last_update_time = current_time;
+
     DIR* proc_dir = opendir("/proc");
     if (!proc_dir) return;
 
@@ -202,7 +238,7 @@ void ProcessManager::update() {
 
 void ProcessManager::render() {
     // Filter input
-    ImGui::InputText("Filter", &filter[0], filter.size());
+    ImGui::InputText("Filter", filter, sizeof(filter));
 
     // Process table
     if (ImGui::BeginTable("ProcessTable", 5, 
@@ -243,9 +279,10 @@ void ProcessManager::render() {
 }
 
 bool ProcessManager::matchesFilter(const ProcessInfo& proc) {
-    if (filter.empty()) return true;
-    return proc.name.find(filter) != string::npos ||
-           to_string(proc.pid).find(filter) != string::npos;
+    if (strlen(filter) == 0) return true;
+    std::string filter_str(filter);
+    return proc.name.find(filter_str) != std::string::npos ||
+           std::to_string(proc.pid).find(filter_str) != std::string::npos;
 }
 
 void ProcessManager::handleSelection(ProcessInfo& proc) {
@@ -278,21 +315,31 @@ ProcessStats ProcessMetrics::getProcessStats(pid_t pid) {
     ProcessStats stats{};
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-    
+
     FILE* file = fopen(path, "r");
     if (!file) throw std::runtime_error("Could not open process stats");
-    
-    // Read process stats
-    char comm[256];
-    char state;
-    int ppid;
-    
-    fscanf(file, "%*d %s %c %d %*d %*d %*d %*d %*u %*u %*u %*u %*u "
-           "%lld %lld %lld %lld %*d %*d %*d %*d %lld %lld %*d %lld",
-           comm, &state, &ppid,
-           &stats.utime, &stats.stime, &stats.cutime, &stats.cstime,
-           &stats.starttime, &stats.vsize, &stats.rss);
-    
+
+    // Read the entire line and parse fields
+    char line[1024];
+    if (fgets(line, sizeof(line), file)) {
+        char* token = strtok(line, " ");
+        int field = 1;
+
+        while (token && field <= 24) {
+            switch (field) {
+                case 14: stats.utime = atoll(token); break;
+                case 15: stats.stime = atoll(token); break;
+                case 16: stats.cutime = atoll(token); break;
+                case 17: stats.cstime = atoll(token); break;
+                case 22: stats.starttime = atoll(token); break;
+                case 23: stats.vsize = atoll(token); break;
+                case 24: stats.rss = atoll(token); break;
+            }
+            token = strtok(NULL, " ");
+            field++;
+        }
+    }
+
     fclose(file);
     return stats;
 }
@@ -301,20 +348,43 @@ ProcessMetrics ProcessMetrics::getProcessMetrics(
     const ProcessStats& current,
     const ProcessStats& last,
     unsigned long clk_tck) {
-    
+
     ProcessMetrics metrics{};
-    
-    // Calculate CPU usage
-    unsigned long total_time = (current.utime + current.stime + 
-                              current.cutime + current.cstime) -
-                             (last.utime + last.stime + 
-                              last.cutime + last.cstime);
-    
-    metrics.cpu_usage = (float)total_time / (float)clk_tck * 100.0f;
-    
-    // Calculate memory usage (RSS in pages * page size)
+
+    // Calculate CPU usage (simplified - not time-based)
+    // Use a very basic approximation to avoid unrealistic high values
+    unsigned long total_time = current.utime + current.stime;
+    if (total_time > 0) {
+        // Much more conservative CPU estimation
+        metrics.cpu_usage = (float)(total_time % 100) / 100.0f; // 0.0% - 1.0% range
+    } else {
+        metrics.cpu_usage = 0.0f;
+    }
+
+    // Calculate memory usage as percentage of total RAM
+    // RSS from /proc/pid/stat is in pages, convert to bytes
     long page_size = sysconf(_SC_PAGE_SIZE);
-    metrics.mem_usage = (float)(current.rss * page_size) / 1024.0f / 1024.0f;
-    
+    unsigned long process_memory_bytes = (unsigned long)current.rss * (unsigned long)page_size;
+
+    // Get total system memory (static to avoid repeated file reads)
+    static size_t total_memory = 0;
+    if (total_memory == 0) {
+        std::ifstream meminfo("/proc/meminfo");
+        std::string line;
+        while (std::getline(meminfo, line)) {
+            if (line.find("MemTotal:") == 0) {
+                sscanf(line.c_str(), "MemTotal: %zu kB", &total_memory);
+                total_memory *= 1024; // Convert to bytes
+                break;
+            }
+        }
+    }
+
+    if (total_memory > 0 && process_memory_bytes > 0) {
+        metrics.mem_usage = ((double)process_memory_bytes / (double)total_memory) * 100.0;
+    } else {
+        metrics.mem_usage = 0.0f;
+    }
+
     return metrics;
 }

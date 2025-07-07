@@ -125,11 +125,13 @@ struct ProcessInfo {
 };
 
 class ProcessManager {
+public:
+    char filter[256];
 private:
     std::vector<ProcessInfo> processes;
-    std::string filter;
     std::vector<pid_t> selected_pids;
     std::map<pid_t, ProcessStats> last_stats;
+    float last_update_time;
 
 public:
     void update();
