@@ -292,22 +292,36 @@ void updateFanData() {
         }
     }
 
-    // Method 3: Try ACPI thermal zone fans
+    // Method 3: Try thermal cooling devices (CPU throttling/fan control)
     if (!fan_found) {
         DIR* thermal = opendir("/sys/class/thermal");
         if (thermal) {
             struct dirent* entry;
             while ((entry = readdir(thermal)) != nullptr) {
-                if (strncmp(entry->d_name, "thermal_zone", 11) == 0) {
+                if (strncmp(entry->d_name, "cooling_device", 14) == 0) {
                     std::string path = "/sys/class/thermal/" + std::string(entry->d_name) + "/";
                     std::string type = readFileContent(path + "type");
-                    if (type.find("fan") != std::string::npos) {
-                        std::string temp = readFileContent(path + "temp");
+                    std::string cur_state = readFileContent(path + "cur_state");
+                    std::string max_state = readFileContent(path + "max_state");
+
+                    // Check if it's a processor cooling device (CPU throttling)
+                    if (type.find("Processor") != std::string::npos ||
+                        type.find("processor") != std::string::npos ||
+                        type.find("Fan") != std::string::npos ||
+                        type.find("fan") != std::string::npos) {
                         try {
-                            g_fan_data.speed = std::stoi(temp);
-                            g_fan_data.enabled = (g_fan_data.speed > 0);
-                            fan_found = true;
-                            break;
+                            int current = std::stoi(cur_state);
+                            int maximum = std::stoi(max_state);
+
+                            // Convert cooling state to appropriate display values
+                            // Higher cooling state = more active cooling
+                            if (maximum > 0) {
+                                g_fan_data.speed = current; // Use raw cooling state (0-3)
+                                g_fan_data.level = (current * 100) / maximum;  // Percentage
+                                g_fan_data.enabled = (current > 0);
+                                fan_found = true;
+                                break;
+                            }
                         } catch (...) {}
                     }
                 }
@@ -396,41 +410,78 @@ void renderCPUTab() {
 void renderFanTab() {
     // FPS Slider
     ImGui::SliderFloat("FPS##fan", &g_fan_data.fps, 1.0f, 60.0f);
-    
-    // Scale Slider
-    ImGui::SliderFloat("Scale##fan", &g_fan_data.scale, 0.0f, 5000.0f);
-    
+
+    // Scale Slider - adjust range based on monitoring type
+    static bool has_cooling_device = (access("/sys/class/thermal/cooling_device0", F_OK) == 0);
+    static bool has_direct_fan = (access("/proc/acpi/ibm/fan", F_OK) == 0);
+
+    float max_scale = (has_cooling_device && !has_direct_fan) ? 10.0f : 5000.0f;
+    ImGui::SliderFloat("Scale##fan", &g_fan_data.scale, 0.0f, max_scale);
+
     // Animation Toggle
     ImGui::Checkbox("Animate##fan", &g_fan_data.animate);
-    
+
     ImGui::Spacing();
-    
-    // Add a notice if fan monitoring is not available
-    static bool fan_available = (access("/sys/class/hwmon", F_OK) == 0 || 
-                               access("/proc/acpi/ibm/fan", F_OK) == 0);
-    
-    if (!fan_available) {
-        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), 
-            "Fan monitoring is not available on this system");
-        ImGui::TextWrapped("This could be because:");
-        ImGui::BulletText("The system doesn't expose fan information");
-        ImGui::BulletText("Required kernel modules are not loaded");
-        ImGui::BulletText("Insufficient permissions to access fan data");
-        ImGui::Spacing();
+
+    // Check what type of cooling/fan data we have
+    static bool has_hwmon_fan = false;
+
+    // Check for hwmon fan files
+    if (!has_hwmon_fan) {
+        DIR* hwmon = opendir("/sys/class/hwmon");
+        if (hwmon) {
+            struct dirent* entry;
+            while ((entry = readdir(hwmon)) != nullptr) {
+                if (entry->d_name[0] == '.') continue;
+                std::string device_path = "/sys/class/hwmon/" + std::string(entry->d_name) + "/fan1_input";
+                if (access(device_path.c_str(), F_OK) == 0) {
+                    has_hwmon_fan = true;
+                    break;
+                }
+            }
+            closedir(hwmon);
+        }
     }
-    
+
+    // Display appropriate status message
+    if (has_direct_fan) {
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "✓ Direct fan monitoring available");
+    } else if (has_hwmon_fan) {
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "✓ Hardware monitoring fan detected");
+    } else if (has_cooling_device) {
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "⚠ Using thermal cooling device");
+        ImGui::TextWrapped("No direct fan monitoring available. Showing CPU thermal throttling state instead.");
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "⚠ No fan monitoring available");
+        ImGui::TextWrapped("This system doesn't expose fan information through standard interfaces.");
+    }
+
+    ImGui::Spacing();
+
     // Status information
-    ImGui::Text("Fan Status: %s", g_fan_data.enabled ? "Active" : "Inactive");
-    ImGui::Text("Speed: %d RPM", g_fan_data.speed);
-    ImGui::Text("Level: %d", g_fan_data.level);
-    
-    // Fan Speed Graph
-    ImGui::PlotLines("Fan Speed", 
-        g_fan_data.history.data(), 
+    if (has_cooling_device && !has_direct_fan && !has_hwmon_fan) {
+        ImGui::Text("Cooling Status: %s", g_fan_data.enabled ? "Active" : "Inactive");
+        ImGui::Text("Throttle Level: %d%%", g_fan_data.level);
+        ImGui::Text("Cooling State: %d", g_fan_data.speed);
+    } else {
+        ImGui::Text("Fan Status: %s", g_fan_data.enabled ? "Active" : "Inactive");
+        ImGui::Text("Speed: %d RPM", g_fan_data.speed);
+        ImGui::Text("Level: %d%%", g_fan_data.level);
+    }
+
+    // Fan/Cooling Graph
+    const char* graph_title = (has_cooling_device && !has_direct_fan && !has_hwmon_fan) ?
+                             "Thermal Cooling" : "Fan Speed";
+    const char* overlay_text = (has_cooling_device && !has_direct_fan && !has_hwmon_fan) ?
+                              ("Cooling: " + std::to_string(g_fan_data.speed)).c_str() :
+                              ("Speed: " + std::to_string(g_fan_data.speed) + " RPM").c_str();
+
+    ImGui::PlotLines(graph_title,
+        g_fan_data.history.data(),
         g_fan_data.history.size(),
-        0, 
-        ("Speed: " + std::to_string(g_fan_data.speed) + " RPM").c_str(),
-        0.0f, 
+        0,
+        overlay_text,
+        0.0f,
         g_fan_data.scale,
         ImVec2(0, 80));
 }
